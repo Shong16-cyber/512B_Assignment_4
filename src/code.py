@@ -9,10 +9,83 @@ import neopixel
 import displayio
 import terminalio
 import random
+import pwmio
+import microcontroller
 import i2cdisplaybus
 import adafruit_displayio_ssd1306
 import adafruit_adxl34x
 from adafruit_display_text import label
+
+# ============================================
+# HIGH SCORE STORAGE (NVM)
+# ============================================
+# Store 3 high scores: each entry = 3 bytes initials + 2 bytes score (big endian)
+# Format: [A, A, A, score_hi, score_lo, B, B, B, score_hi, score_lo, ...]
+# Total: 15 bytes for 3 high scores
+
+HIGH_SCORE_COUNT = 3
+HIGH_SCORE_ENTRY_SIZE = 5  # 3 chars + 2 bytes for score
+
+def load_high_scores():
+    """Load high scores from NVM"""
+    scores = []
+    try:
+        nvm = microcontroller.nvm
+        for i in range(HIGH_SCORE_COUNT):
+            offset = i * HIGH_SCORE_ENTRY_SIZE
+            # Read initials (3 bytes)
+            initials = ""
+            for j in range(3):
+                c = nvm[offset + j]
+                if 65 <= c <= 90:  # A-Z
+                    initials += chr(c)
+                else:
+                    initials += "A"
+            # Read score (2 bytes, big endian)
+            score = (nvm[offset + 3] << 8) | nvm[offset + 4]
+            if score > 9999:
+                score = 0
+            scores.append({"initials": initials, "score": score})
+    except:
+        # If NVM not available or error, return default
+        scores = [{"initials": "AAA", "score": 0} for _ in range(HIGH_SCORE_COUNT)]
+    return scores
+
+def save_high_scores(scores):
+    """Save high scores to NVM"""
+    try:
+        nvm = microcontroller.nvm
+        for i in range(HIGH_SCORE_COUNT):
+            offset = i * HIGH_SCORE_ENTRY_SIZE
+            initials = scores[i]["initials"]
+            score = scores[i]["score"]
+            # Write initials
+            for j in range(3):
+                nvm[offset + j] = ord(initials[j]) if j < len(initials) else 65
+            # Write score (big endian)
+            nvm[offset + 3] = (score >> 8) & 0xFF
+            nvm[offset + 4] = score & 0xFF
+    except:
+        pass  # NVM write failed, ignore
+
+def is_high_score(score, scores):
+    """Check if score qualifies for high score board"""
+    if score <= 0:
+        return False
+    for hs in scores:
+        if score > hs["score"]:
+            return True
+    return False
+
+def insert_high_score(initials, score, scores):
+    """Insert a new high score into the list"""
+    new_entry = {"initials": initials, "score": score}
+    scores.append(new_entry)
+    scores.sort(key=lambda x: x["score"], reverse=True)
+    return scores[:HIGH_SCORE_COUNT]
+
+# Load high scores at startup
+high_scores = load_high_scores()
 
 # ============================================
 # HARDWARE SETUP
@@ -44,6 +117,12 @@ accelerometer = adafruit_adxl34x.ADXL345(i2c)
 NUM_PIXELS = 8
 pixels = neopixel.NeoPixel(board.D3, NUM_PIXELS, brightness=0.3, auto_write=False)
 
+# Buzzer setup on D2
+buzzer = pwmio.PWMOut(board.D2, variable_frequency=True, duty_cycle=0)
+
+# Flag for first boot (splash screen)
+first_boot = True
+
 # Encoder setup
 encoder_clk = digitalio.DigitalInOut(board.D0)
 encoder_clk.direction = digitalio.Direction.INPUT
@@ -61,6 +140,59 @@ btn_pin.pull = digitalio.Pull.UP
 prev_btn_state = True  # True = not pressed
 last_btn_change_time = 0
 DEBOUNCE_TIME = 0.05  # 50ms debounce
+
+# ============================================
+# BUZZER SOUND FUNCTIONS
+# ============================================
+def play_tone(frequency, duration):
+    """Play a single tone"""
+    buzzer.frequency = frequency
+    buzzer.duty_cycle = 32768  # 50% duty cycle
+    time.sleep(duration)
+    buzzer.duty_cycle = 0
+
+def sound_collect():
+    """Sound for collecting an ingredient - short happy beep"""
+    play_tone(880, 0.05)  # A5
+    play_tone(1100, 0.05)  # C#6
+
+def sound_fail():
+    """Sound for wrong move or penalty - low buzz"""
+    play_tone(200, 0.1)
+    play_tone(150, 0.15)
+
+def sound_start():
+    """Sound for game start - ascending tune"""
+    play_tone(523, 0.1)   # C5
+    play_tone(659, 0.1)   # E5
+    play_tone(784, 0.1)   # G5
+    play_tone(1047, 0.15) # C6
+
+def sound_game_over():
+    """Sound for game over - descending sad tune"""
+    play_tone(392, 0.15)  # G4
+    play_tone(330, 0.15)  # E4
+    play_tone(262, 0.2)   # C4
+
+def sound_win():
+    """Sound for winning - victory fanfare"""
+    play_tone(523, 0.1)   # C5
+    play_tone(659, 0.1)   # E5
+    play_tone(784, 0.1)   # G5
+    play_tone(1047, 0.1)  # C6
+    time.sleep(0.05)
+    play_tone(784, 0.1)   # G5
+    play_tone(1047, 0.2)  # C6
+
+def sound_level_clear():
+    """Sound for level complete"""
+    play_tone(784, 0.1)   # G5
+    play_tone(988, 0.1)   # B5
+    play_tone(1175, 0.15) # D6
+
+def sound_select():
+    """Sound for menu selection - click"""
+    play_tone(600, 0.03)
 
 # ============================================
 # ICONS (8x8 bitmaps)
@@ -421,6 +553,81 @@ def make_icon(name):
                 bmp[x, y] = 1
     return bmp, pal
 
+def show_splash():
+    """Animated splash screen with roaming food ingredients"""
+    # Food icons to animate
+    foods = ["egg", "milk", "bacon", "tomato", "cheese", "fish", "carrot", "apple"]
+    
+    # Initial positions and velocities for each food
+    items = []
+    for i, food in enumerate(foods):
+        items.append({
+            "name": food,
+            "x": random.randint(10, 110),
+            "y": random.randint(10, 50),
+            "vx": random.choice([-2, -1, 1, 2]),
+            "vy": random.choice([-2, -1, 1, 2])
+        })
+    
+    # Play startup sound
+    play_tone(440, 0.05)
+    play_tone(554, 0.05)
+    play_tone(659, 0.1)
+    
+    # Animate for 2 seconds
+    start_time = time.monotonic()
+    frame = 0
+    while time.monotonic() - start_time < 2.0:
+        g = displayio.Group()
+        
+        # Title text
+        t1 = "HARVEST HUSTLE"
+        g.append(label.Label(terminalio.FONT, text=t1, color=0xFFFFFF, x=14, y=32))
+        
+        # Update and draw each food item
+        for item in items:
+            # Update position
+            item["x"] += item["vx"]
+            item["y"] += item["vy"]
+            
+            # Bounce off walls
+            if item["x"] <= 0 or item["x"] >= 120:
+                item["vx"] *= -1
+            if item["y"] <= 0 or item["y"] >= 56:
+                item["vy"] *= -1
+            
+            # Keep in bounds
+            item["x"] = max(0, min(120, item["x"]))
+            item["y"] = max(0, min(56, item["y"]))
+            
+            # Draw icon
+            bmp, pal = make_icon(item["name"])
+            tg = displayio.TileGrid(bmp, pixel_shader=pal, x=int(item["x"]), y=int(item["y"]))
+            g.append(tg)
+        
+        display.root_group = g
+        
+        # LED animation - rainbow effect
+        for i in range(NUM_PIXELS):
+            hue = (frame * 10 + i * 32) % 256
+            if hue < 85:
+                r, g_c, b = 255 - hue * 3, hue * 3, 0
+            elif hue < 170:
+                hue -= 85
+                r, g_c, b = 0, 255 - hue * 3, hue * 3
+            else:
+                hue -= 170
+                r, g_c, b = hue * 3, 0, 255 - hue * 3
+            pixels[i] = (r, g_c, b)
+        pixels.show()
+        
+        frame += 1
+        time.sleep(0.05)
+    
+    # Clear LEDs
+    pixels.fill((0, 0, 0))
+    pixels.show()
+
 # ============================================
 # CONSTANTS
 # ============================================
@@ -514,9 +721,10 @@ LEVELS = [
         ],
         "dish": "Citrus Fish",
         "animals": [],
-        "waves": True,
+        "waves": False,  # No wave lines
         "trees": True,
         "cooking": None,
+        "spawn_fast": True,  # Fish spawn more frequently
     },
     {  # Level 7
         "name": "Hearty Stew",
@@ -568,9 +776,10 @@ LEVELS = [
         ],
         "dish": "Grand Seafood Platter",
         "animals": [("shark", "danger")],
-        "waves": True,
+        "waves": False,  # No wave lines
         "shark_eats_fish": True,  # Shark collision reduces fish count
         "cooking": None,
+        "spawn_fast": True,  # Fish spawn more frequently
     },
     {  # Level 11
         "name": "Gourmet",
@@ -625,6 +834,18 @@ class Game:
         self.last_btn_time = 0
         self.intro_page = 0
         self.over_choice = 0  # 0=Retry, 1=Restart
+        self.score = 0  # Player score
+        self.level_score = 0  # Score for current level
+        self.initials = ""  # For high score entry
+        self.initial_char = 0  # Current character (0-25 = A-Z)
+        self.is_new_high_score = False  # Flag for new high score
+        self.after_highscore = "reset"  # What to do after high score screen: "reset" or "restart"
+
+# Score points for each collection method
+SCORE_TILT = 10
+SCORE_TOUCH = 20
+SCORE_SHAKE = 30
+SCORE_ROTATE = 50
 
 game = Game()
 
@@ -637,6 +858,7 @@ def read_accel():
     
     if total > SHAKE_THRESHOLD:
         return "SHAKE"
+    # Original mapping
     if abs(x) > TILT_THRESHOLD and abs(x) > abs(y):
         return "RIGHT" if x > 0 else "LEFT"
     if abs(y) > TILT_THRESHOLD and abs(y) > abs(x):
@@ -986,7 +1208,11 @@ def show_clear():
         scroll = 0
     
     ct = "LEVEL CLEAR!"
-    g.append(label.Label(terminalio.FONT, text=ct, color=0xFFFFFF, x=center_x(ct)-scroll, y=12))
+    g.append(label.Label(terminalio.FONT, text=ct, color=0xFFFFFF, x=center_x(ct)-scroll, y=8))
+    
+    # Level score
+    score_txt = f"+{game.level_score}pts"
+    g.append(label.Label(terminalio.FONT, text=score_txt, color=0xFFFFFF, x=center_x(score_txt)-scroll, y=20))
     
     # Icons
     ings = lv["ingredients"]
@@ -994,12 +1220,12 @@ def show_clear():
     sx = (128 - tw) // 2 - scroll
     for ing, _, _ in ings:
         ib, ip = make_icon(ing)
-        g.append(displayio.TileGrid(ib, pixel_shader=ip, x=sx, y=26))
+        g.append(displayio.TileGrid(ib, pixel_shader=ip, x=sx, y=30))
         sx += 12
     
     # Dish name
     dish = lv["dish"]
-    g.append(label.Label(terminalio.FONT, text=dish, color=0xFFFFFF, x=center_x(dish)-scroll, y=44))
+    g.append(label.Label(terminalio.FONT, text=dish, color=0xFFFFFF, x=center_x(dish)-scroll, y=46))
     
     g.append(label.Label(terminalio.FONT, text="[Press Next]", color=0xFFFFFF, x=28, y=58))
     display.root_group = g
@@ -1007,23 +1233,76 @@ def show_clear():
 
 def show_over():
     g = displayio.Group()
-    g.append(label.Label(terminalio.FONT, text="GAME OVER", color=0xFFFFFF, x=center_x("GAME OVER"), y=12))
-    lt = f"Level {game.level+1}"
-    g.append(label.Label(terminalio.FONT, text=lt, color=0xFFFFFF, x=center_x(lt), y=26))
+    g.append(label.Label(terminalio.FONT, text="GAME OVER", color=0xFFFFFF, x=center_x("GAME OVER"), y=8))
+    
+    # Show final score
+    score_txt = f"Score: {game.score}"
+    g.append(label.Label(terminalio.FONT, text=score_txt, color=0xFFFFFF, x=center_x(score_txt), y=22))
     
     # Two options: Retry (0) or Restart (1)
     retry_pre = "> " if game.over_choice == 0 else "  "
     restart_pre = "> " if game.over_choice == 1 else "  "
     
-    g.append(label.Label(terminalio.FONT, text=retry_pre + "Retry Level", color=0xFFFFFF, x=24, y=42))
+    g.append(label.Label(terminalio.FONT, text=retry_pre + "Retry Level", color=0xFFFFFF, x=24, y=40))
     g.append(label.Label(terminalio.FONT, text=restart_pre + "Restart Game", color=0xFFFFFF, x=24, y=54))
     display.root_group = g
 
 def show_win():
     g = displayio.Group()
-    g.append(label.Label(terminalio.FONT, text="YOU WIN!", color=0xFFFFFF, x=center_x("YOU WIN!"), y=18))
-    g.append(label.Label(terminalio.FONT, text="MASTER CHEF!", color=0xFFFFFF, x=center_x("MASTER CHEF!"), y=35))
-    g.append(label.Label(terminalio.FONT, text="[Press Restart]", color=0xFFFFFF, x=center_x("[Press Restart]"), y=55))
+    g.append(label.Label(terminalio.FONT, text="YOU WIN!", color=0xFFFFFF, x=center_x("YOU WIN!"), y=10))
+    g.append(label.Label(terminalio.FONT, text="MASTER CHEF!", color=0xFFFFFF, x=center_x("MASTER CHEF!"), y=24))
+    
+    # Show final score
+    score_txt = f"Final Score: {game.score}"
+    g.append(label.Label(terminalio.FONT, text=score_txt, color=0xFFFFFF, x=center_x(score_txt), y=40))
+    
+    g.append(label.Label(terminalio.FONT, text="[Press Continue]", color=0xFFFFFF, x=center_x("[Press Continue]"), y=56))
+    display.root_group = g
+
+def show_high_scores():
+    """Display the high score board"""
+    g = displayio.Group()
+    g.append(label.Label(terminalio.FONT, text="HIGH SCORES", color=0xFFFFFF, x=center_x("HIGH SCORES"), y=8))
+    
+    y_pos = 22
+    for i, hs in enumerate(high_scores):
+        rank = f"{i+1}."
+        txt = f"{rank} {hs['initials']} {hs['score']:>4}"
+        g.append(label.Label(terminalio.FONT, text=txt, color=0xFFFFFF, x=30, y=y_pos))
+        y_pos += 12
+    
+    g.append(label.Label(terminalio.FONT, text="[Press Continue]", color=0xFFFFFF, x=center_x("[Press Continue]"), y=58))
+    display.root_group = g
+
+def show_initials_entry():
+    """Screen for entering initials for high score"""
+    g = displayio.Group()
+    g.append(label.Label(terminalio.FONT, text="NEW HIGH SCORE!", color=0xFFFFFF, x=center_x("NEW HIGH SCORE!"), y=8))
+    
+    score_txt = f"Score: {game.score}"
+    g.append(label.Label(terminalio.FONT, text=score_txt, color=0xFFFFFF, x=center_x(score_txt), y=22))
+    
+    g.append(label.Label(terminalio.FONT, text="Enter Initials:", color=0xFFFFFF, x=center_x("Enter Initials:"), y=36))
+    
+    # Display initials with cursor
+    initials_display = ""
+    for i in range(3):
+        if i < len(game.initials):
+            initials_display += game.initials[i]
+        elif i == len(game.initials):
+            # Current position - show with underscore
+            initials_display += chr(65 + game.initial_char)
+        else:
+            initials_display += "_"
+        initials_display += " "
+    
+    # Draw initials larger
+    g.append(label.Label(terminalio.FONT, text=initials_display, color=0xFFFFFF, x=center_x(initials_display), y=50))
+    
+    # Show cursor indicator
+    cursor_x = center_x(initials_display) + len(game.initials) * 12
+    g.append(label.Label(terminalio.FONT, text="^", color=0xFFFFFF, x=cursor_x, y=58))
+    
     display.root_group = g
 
 # ============================================
@@ -1034,16 +1313,18 @@ def px_off():
     pixels.show()
 
 def px_success():
+    """Success feedback with sound"""
     pixels.fill(COLOR_GREEN)
     pixels.show()
-    time.sleep(0.08)
+    sound_collect()
     pixels.fill(COLOR_OFF)
     pixels.show()
 
 def px_fail():
+    """Fail/Game over feedback with sound"""
     pixels.fill(COLOR_RED)
     pixels.show()
-    time.sleep(0.15)
+    sound_game_over()
     pixels.fill(COLOR_OFF)
     pixels.show()
 
@@ -1055,6 +1336,8 @@ def px_spawn():
     pixels.show()
 
 def px_complete():
+    """Level complete feedback with sound"""
+    sound_level_clear()
     for c in [COLOR_RED, COLOR_YELLOW, COLOR_GREEN, COLOR_BLUE, COLOR_PURPLE]:
         pixels.fill(c)
         pixels.show()
@@ -1069,9 +1352,10 @@ def px_cooking(p):
     pixels.show()
 
 def px_penalty():
+    """Penalty feedback with sound"""
     pixels.fill(COLOR_RED)
     pixels.show()
-    time.sleep(0.08)
+    sound_fail()
     pixels.fill(COLOR_OFF)
     pixels.show()
 
@@ -1095,6 +1379,7 @@ def init_level():
     game.rotate_target = None
     game.rotate_count = 0
     game.penalty = 0
+    game.level_score = 0  # Reset level score
     
     # Waves for water levels - random number of waves inside game area
     if lv.get("waves"):
@@ -1152,29 +1437,14 @@ def spawn_items(lv, count=1):
             vx = 0
         else:
             x = random.randint(18, 110)
-            # For fish in wave levels, spawn between waves
-            if lv.get("waves") and ing == "fish":
-                # Spawn fish at positions that avoid wave lines
-                safe_y = []
-                for y_test in range(16, 46, 2):
-                    is_safe = True
-                    for wy in game.waves_y:
-                        if abs(y_test - wy) < 8:
-                            is_safe = False
-                            break
-                    if is_safe:
-                        safe_y.append(y_test)
-                if safe_y:
-                    y = random.choice(safe_y)
-                else:
-                    y = 16  # Top of play area
-            elif lv.get("waves"):
-                # Other items avoid waves too
-                y = random.choice([16, 30, 44])
+            y = random.randint(18, 44)
+            # Slower movement for fish so they stay longer
+            if ing == "fish":
+                vx = random.uniform(-0.15, 0.15)
+                vy = random.uniform(-0.1, 0.1)
             else:
-                y = random.randint(18, 44)
-            vx = random.uniform(-0.3, 0.3)
-            vy = random.uniform(-0.2, 0.2)
+                vx = random.uniform(-0.3, 0.3)
+                vy = random.uniform(-0.2, 0.2)
         
         game.items.append({
             "name": ing, "x": x, "y": y,
@@ -1302,13 +1572,15 @@ def check_catch(is_shake):
         if dist < 12:
             m = it.get("method", "tilt")
             if m == "tilt":
-                caught.append(it)
+                caught.append((it, SCORE_TILT))
             elif m == "shake" and is_shake:
-                caught.append(it)
+                caught.append((it, SCORE_SHAKE))
     
-    for it in caught:
+    for it, points in caught:
         game.items.remove(it)
         game.collected[it["name"]] = game.collected.get(it["name"], 0) + 1
+        game.score += points
+        game.level_score += points
         px_success()
 
 def check_touch():
@@ -1340,6 +1612,9 @@ def check_touch():
                 elif a["type"] in ["chicken", "duck", "turkey", "lamb"]:
                     game.collected[a["type"]] = game.collected.get(a["type"], 0) + 1
                 
+                # Add touch score
+                game.score += SCORE_TOUCH
+                game.level_score += SCORE_TOUCH
                 px_success()
                 game.touch_target = None
                 game.touch_start = now
@@ -1381,6 +1656,9 @@ def check_tree_shake(is_shake):
         if dist < 18:
             game.collected[t["ing"]] = game.collected.get(t["ing"], 0) + 1
             t["visible"] = False
+            # Tree shake is a shake collection
+            game.score += SCORE_SHAKE
+            game.level_score += SCORE_SHAKE
             px_success()
 
 def check_bee_shake(is_shake):
@@ -1424,6 +1702,9 @@ def check_rotate(rot):
             if game.rotate_count >= rotate_needed:
                 game.items.remove(it)
                 game.collected[it["name"]] = game.collected.get(it["name"], 0) + 1
+                # Rotate collection - highest score
+                game.score += SCORE_ROTATE
+                game.level_score += SCORE_ROTATE
                 px_success()
                 game.rotate_target = None
                 game.rotate_count = 0
@@ -1464,7 +1745,14 @@ def move(m, lv):
 # MAIN LOOP
 # ============================================
 def main():
+    global first_boot, high_scores
     print("Harvest Hustle Starting...")
+    
+    # Show splash screen only on first boot (power on)
+    if first_boot:
+        show_splash()
+        first_boot = False
+    
     px_off()
     
     spawn_timer = 0
@@ -1484,9 +1772,10 @@ def main():
         if game.screen == "title":
             show_title()
             if btn:
+                sound_start()
                 px_success()
                 game.screen = "mode"
-                time.sleep(0.3)
+                time.sleep(0.2)
         
         elif game.screen == "mode":
             if rot > 0:
@@ -1500,10 +1789,14 @@ def main():
             game.difficulty = ["EASY", "MEDIUM", "HARD"][game.diff_idx]
             show_mode()
             if btn:
-                px_success()
+                pixels.fill(COLOR_GREEN)
+                pixels.show()
+                time.sleep(0.1)
+                pixels.fill(COLOR_OFF)
+                pixels.show()
                 game.level_select_idx = 0
                 game.screen = "level_select"
-                time.sleep(0.3)
+                time.sleep(0.2)
         
         elif game.screen == "level_select":
             if rot > 0:
@@ -1516,6 +1809,7 @@ def main():
                 pixels.show()
             show_level_select()
             if btn:
+                sound_start()
                 px_success()
                 game.level = game.level_select_idx
                 game.scroll_offset = 0
@@ -1576,8 +1870,10 @@ def main():
             
             # Spawn items
             spawn_timer += dt
-            if spawn_timer > 2.5 and len(game.items) < 4:
-                spawn_items(lv, 1)
+            spawn_interval = 2.0 if lv.get("spawn_fast") else 2.5
+            max_items = 4  # Keep at 4
+            if spawn_timer > spawn_interval and len(game.items) < max_items:
+                spawn_items(lv, 2 if lv.get("spawn_fast") else 1)
                 spawn_timer = 0
             
             # Spawn trees
@@ -1666,7 +1962,11 @@ def main():
                 game.level += 1
                 game.scroll_offset = 0
                 game.intro_page = 0
-                game.screen = "win" if game.level >= len(LEVELS) else "intro"
+                if game.level >= len(LEVELS):
+                    sound_win()  # Victory sound!
+                    game.screen = "win"
+                else:
+                    game.screen = "intro"
                 time.sleep(0.3)
         
         elif game.screen == "over":
@@ -1684,8 +1984,14 @@ def main():
             # Press to confirm
             if btn:
                 if game.over_choice == 0:
-                    # Retry Level
-                    px_success()
+                    # Retry Level - forfeit points from failed attempt
+                    game.score -= game.level_score
+                    sound_start()
+                    pixels.fill(COLOR_GREEN)
+                    pixels.show()
+                    time.sleep(0.1)
+                    pixels.fill(COLOR_OFF)
+                    pixels.show()
                     game.scroll_offset = 0
                     game.intro_page = 0
                     init_level()
@@ -1695,17 +2001,76 @@ def main():
                     rotate_timer = 0
                     time.sleep(0.2)
                 else:
-                    # Restart Game - go to difficulty mode
-                    px_complete()
-                    game.screen = "mode"
-                    game.diff_idx = 0
+                    # Restart Game - check for high score first
+                    game.after_highscore = "restart"
+                    if is_high_score(game.score, high_scores):
+                        game.is_new_high_score = True
+                        game.initials = ""
+                        game.initial_char = 0
+                        game.screen = "enter_initials"
+                    else:
+                        game.screen = "highscores"
                     time.sleep(0.2)
         
         elif game.screen == "win":
             show_win()
+            # Rainbow LED celebration
+            for i in range(NUM_PIXELS):
+                hue = (int(time.monotonic() * 100) + i * 32) % 256
+                if hue < 85:
+                    r, g_c, b = 255 - hue * 3, hue * 3, 0
+                elif hue < 170:
+                    hue -= 85
+                    r, g_c, b = 0, 255 - hue * 3, hue * 3
+                else:
+                    hue -= 170
+                    r, g_c, b = hue * 3, 0, 255 - hue * 3
+                pixels[i] = (r, g_c, b)
+            pixels.show()
+            
+            if btn:
+                # Check if this is a high score
+                game.after_highscore = "reset"
+                if is_high_score(game.score, high_scores):
+                    game.is_new_high_score = True
+                    game.initials = ""
+                    game.initial_char = 0
+                    game.screen = "enter_initials"
+                else:
+                    game.screen = "highscores"
+                time.sleep(0.3)
+        
+        elif game.screen == "enter_initials":
+            show_initials_entry()
+            
+            # Rotate to change character
+            if rot > 0:
+                game.initial_char = (game.initial_char + 1) % 26
+            
+            # Press to confirm character
+            if btn:
+                game.initials += chr(65 + game.initial_char)
+                game.initial_char = 0
+                
+                if len(game.initials) >= 3:
+                    # Save the high score
+                    high_scores = insert_high_score(game.initials, game.score, high_scores)
+                    save_high_scores(high_scores)
+                    sound_level_clear()
+                    game.screen = "highscores"
+                time.sleep(0.2)
+        
+        elif game.screen == "highscores":
+            show_high_scores()
+            
             if btn:
                 px_complete()
-                game.reset()
+                if game.after_highscore == "restart":
+                    game.score = 0
+                    game.screen = "mode"
+                    game.diff_idx = 0
+                else:
+                    game.reset()
                 time.sleep(0.3)
         
         time.sleep(0.005)  # 5ms for better responsiveness
