@@ -132,7 +132,7 @@ For example, chasing the chicken or pig to collect ingredients, or shaking the c
 
 #### Level 6: Lakeside
 - **Ingredients:** Fish ×3 (tilt), Lemon ×3 (shake trees)
-- **Special:** Waves animation, Fruit trees
+- **Special:** Fruit trees
 - **Dish:** Citrus Fish
 
 #### Level 7: Hearty Stew
@@ -158,7 +158,7 @@ For example, chasing the chicken or pig to collect ingredients, or shaking the c
 #### Level 10: Ocean Bounty
 - **Ingredients:** Fish ×4 (tilt), Shell ×5 (tilt), Seaweed ×5 (shake)
 - **Animals:** Shark (danger) 🦈
-- **Special:** Waves, Shark eats your collected fish!
+- **Special:** Shark eats your collected fish!
 - **Dish:** Grand Seafood Platter
 
 #### Level 11: Gourmet (Final Level)
